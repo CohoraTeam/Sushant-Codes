@@ -1,28 +1,25 @@
 #!/usr/bin/env python
 # coding: utf-8
 
-# In[3]:
+# In[1]:
 
 
 import pandas as pd
 import numpy as np
-import json
+import yaml
 import warnings
 from google.cloud import bigquery
 
 # Suppress BigQuery storage warnings if running locally without it
 warnings.filterwarnings("ignore", category=UserWarning)
 
-# ==========================================
-# 1. BIGQUERY ENGAGEMENT SCORING FUNCTION
-# ==========================================
-def get_engagement_scores(tenant_project_id: str, tenant_config: dict) -> pd.DataFrame:
+def get_engagement_scores(bq_client: bigquery.Client, config: dict, tenant_config: dict) -> pd.DataFrame:
     """
-    Executes the 90-Day Rolling Engagement SQL in BigQuery dynamically using tenant weights.
+    Executes the 90-Day Rolling Engagement SQL in BigQuery dynamically using tenant weights and YAML config.
     """
-    bq_client = bigquery.Client()
-
-    # Extract the weights dictionary for cleaner f-string formatting
+    tenant_project_id = config['tenant']['project_id']
+    dataset = config['tenant']['cohora_dataset']
+    tbl = config['tables']
     weights = tenant_config.get("engagement_weights", {})
 
     sql_query = f"""
@@ -30,153 +27,151 @@ def get_engagement_scores(tenant_project_id: str, tenant_config: dict) -> pd.Dat
             SELECT DATE_SUB(CURRENT_DATE(), INTERVAL 90 DAY) AS start_date
         ),
 
-        -- STEP 1: GATHER EVERY SINGLE INDIVIDUAL EVENT WITH CUSTOM BASE WEIGHTS
         raw_events AS (
             SELECT l.profile_id, DATE(l.created_at) AS event_date, 'Like' AS Event_Name, {weights.get('like', 1)} AS Base_Weight
-            FROM `{tenant_project_id}.cohora.like` l 
-            JOIN `{tenant_project_id}.cohora.profile` p ON l.profile_id = p.id
+            FROM `{tenant_project_id}.{dataset}.{tbl['like']}` l 
+            JOIN `{tenant_project_id}.{dataset}.{tbl['profile']}` p ON l.profile_id = p.id
             CROSS JOIN window_dates w
             WHERE DATE(l.created_at) >= w.start_date AND l.external_type = 'POST'
               AND (p.tenant_admin = FALSE OR p.tenant_admin IS NULL)
 
             UNION ALL
             SELECT c.profile_id, DATE(c.created_at) AS event_date, 'Comment' AS Event_Name, {weights.get('comment', 5)} AS Base_Weight
-            FROM `{tenant_project_id}.cohora.comment` c 
-            JOIN `{tenant_project_id}.cohora.profile` p ON c.profile_id = p.id
+            FROM `{tenant_project_id}.{dataset}.{tbl['comment']}` c 
+            JOIN `{tenant_project_id}.{dataset}.{tbl['profile']}` p ON c.profile_id = p.id
             CROSS JOIN window_dates w
             WHERE DATE(c.created_at) >= w.start_date AND c.external_type = 'POST'
               AND (p.tenant_admin = FALSE OR p.tenant_admin IS NULL)
 
             UNION ALL
             SELECT s.profile_id, DATE(s.created_at) AS event_date, 'Share' AS Event_Name, {weights.get('share', 6)} AS Base_Weight
-            FROM `{tenant_project_id}.cohora.push_out` s 
-            JOIN `{tenant_project_id}.cohora.profile` p ON s.profile_id = p.id
+            FROM `{tenant_project_id}.{dataset}.{tbl['push_out']}` s 
+            JOIN `{tenant_project_id}.{dataset}.{tbl['profile']}` p ON s.profile_id = p.id
             CROSS JOIN window_dates w
             WHERE DATE(s.created_at) >= w.start_date AND s.external_type = 'POST'
               AND (p.tenant_admin = FALSE OR p.tenant_admin IS NULL)
 
             UNION ALL
             SELECT p.id AS profile_id, DATE(p.last_updated_at) AS event_date, 'Complete profile' AS Event_Name, {weights.get('profile_completion', 4)} AS Base_Weight
-            FROM `{tenant_project_id}.cohora.profile` p 
+            FROM `{tenant_project_id}.{dataset}.{tbl['profile']}` p 
             CROSS JOIN window_dates w
             WHERE DATE(p.last_updated_at) >= w.start_date AND p.name IS NOT NULL AND p.email IS NOT NULL AND p.photo_asset_id IS NOT NULL
               AND (p.tenant_admin = FALSE OR p.tenant_admin IS NULL)
 
             UNION ALL
             SELECT l.profile_id, DATE(l.created_at) AS event_date, 'Contest Like' AS Event_Name, {weights.get('contest_like', 4)} AS Base_Weight
-            FROM `{tenant_project_id}.cohora.like` l 
-            JOIN `{tenant_project_id}.cohora.profile` p ON l.profile_id = p.id
+            FROM `{tenant_project_id}.{dataset}.{tbl['like']}` l 
+            JOIN `{tenant_project_id}.{dataset}.{tbl['profile']}` p ON l.profile_id = p.id
             CROSS JOIN window_dates w
             WHERE DATE(l.created_at) >= w.start_date AND l.external_type = 'CONTEST'
               AND (p.tenant_admin = FALSE OR p.tenant_admin IS NULL)
 
             UNION ALL
             SELECT c.profile_id, DATE(c.created_at) AS event_date, 'Contest Comments' AS Event_Name, {weights.get('contest_comment', 5)} AS Base_Weight
-            FROM `{tenant_project_id}.cohora.comment` c 
-            JOIN `{tenant_project_id}.cohora.contest_entry` ce ON c.external_id = ce.id 
-            JOIN `{tenant_project_id}.cohora.profile` p ON c.profile_id = p.id
+            FROM `{tenant_project_id}.{dataset}.{tbl['comment']}` c 
+            JOIN `{tenant_project_id}.{dataset}.{tbl['contest_entry']}` ce ON c.external_id = ce.id 
+            JOIN `{tenant_project_id}.{dataset}.{tbl['profile']}` p ON c.profile_id = p.id
             CROSS JOIN window_dates w
             WHERE DATE(c.created_at) >= w.start_date
               AND (p.tenant_admin = FALSE OR p.tenant_admin IS NULL)
 
             UNION ALL
             SELECT pa.profile_id, DATE(pa.created_at) AS event_date, 'Email click' AS Event_Name, {weights.get('email_click', 4)} AS Base_Weight
-            FROM `{tenant_project_id}.cohora.profile_activity` pa 
-            JOIN `{tenant_project_id}.cohora.profile` p ON pa.profile_id = p.id
+            FROM `{tenant_project_id}.{dataset}.{tbl['profile_activity']}` pa 
+            JOIN `{tenant_project_id}.{dataset}.{tbl['profile']}` p ON pa.profile_id = p.id
             CROSS JOIN window_dates w
             WHERE DATE(pa.created_at) >= w.start_date AND pa.type IN ('MESSAGE_CLICKED', 'MESSAGE_READ')
               AND (p.tenant_admin = FALSE OR p.tenant_admin IS NULL)
 
             UNION ALL
             SELECT pa.profile_id, DATE(pa.created_at) AS event_date, 'Scratch a card' AS Event_Name, {weights.get('scratch_card', 5)} AS Base_Weight
-            FROM `{tenant_project_id}.cohora.profile_activity` pa 
-            JOIN `{tenant_project_id}.cohora.profile` p ON pa.profile_id = p.id
+            FROM `{tenant_project_id}.{dataset}.{tbl['profile_activity']}` pa 
+            JOIN `{tenant_project_id}.{dataset}.{tbl['profile']}` p ON pa.profile_id = p.id
             CROSS JOIN window_dates w
             WHERE DATE(pa.created_at) >= w.start_date AND pa.type = 'SCRATCH_CARD_OPENED'
               AND (p.tenant_admin = FALSE OR p.tenant_admin IS NULL)
 
             UNION ALL
             SELECT pa_asset.profile_id, DATE(pa_asset.created_at) AS event_date, 'Creator post' AS Event_Name, {weights.get('creator_post', 6)} AS Base_Weight
-            FROM `{tenant_project_id}.cohora.post_asset` pa_asset
-            JOIN `{tenant_project_id}.cohora.profile` p ON pa_asset.profile_id = p.id
+            FROM `{tenant_project_id}.{dataset}.{tbl['post_asset']}` pa_asset
+            JOIN `{tenant_project_id}.{dataset}.{tbl['profile']}` p ON pa_asset.profile_id = p.id
             CROSS JOIN window_dates w
             WHERE DATE(pa_asset.created_at) >= w.start_date
               AND (p.tenant_admin = FALSE OR p.tenant_admin IS NULL)
 
             UNION ALL
             SELECT po.profile_id, DATE(po.created_at) AS event_date, 'Poll' AS Event_Name, {weights.get('poll', 6)} AS Base_Weight
-            FROM `{tenant_project_id}.cohora.post` po
-            JOIN `{tenant_project_id}.cohora.profile` p ON po.profile_id = p.id
+            FROM `{tenant_project_id}.{dataset}.{tbl['post']}` po
+            JOIN `{tenant_project_id}.{dataset}.{tbl['profile']}` p ON po.profile_id = p.id
             CROSS JOIN window_dates w
             WHERE DATE(po.created_at) >= w.start_date AND po.post_type = 'POLL'
               AND (p.tenant_admin = FALSE OR p.tenant_admin IS NULL)
 
             UNION ALL
             SELECT po.profile_id, DATE(po.created_at) AS event_date, 'Survey' AS Event_Name, {weights.get('survey', 7)} AS Base_Weight
-            FROM `{tenant_project_id}.cohora.post` po
-            JOIN `{tenant_project_id}.cohora.profile` p ON po.profile_id = p.id
+            FROM `{tenant_project_id}.{dataset}.{tbl['post']}` po
+            JOIN `{tenant_project_id}.{dataset}.{tbl['profile']}` p ON po.profile_id = p.id
             CROSS JOIN window_dates w
             WHERE DATE(po.created_at) >= w.start_date AND po.post_type = 'SURVEY'
               AND (p.tenant_admin = FALSE OR p.tenant_admin IS NULL)
 
             UNION ALL
             SELECT po.profile_id, DATE(po.created_at) AS event_date, 'Quiz' AS Event_Name, {weights.get('quiz', 7)} AS Base_Weight
-            FROM `{tenant_project_id}.cohora.post` po
-            JOIN `{tenant_project_id}.cohora.profile` p ON po.profile_id = p.id
+            FROM `{tenant_project_id}.{dataset}.{tbl['post']}` po
+            JOIN `{tenant_project_id}.{dataset}.{tbl['profile']}` p ON po.profile_id = p.id
             CROSS JOIN window_dates w
             WHERE DATE(po.created_at) >= w.start_date AND po.post_type = 'QUIZ'
               AND (p.tenant_admin = FALSE OR p.tenant_admin IS NULL)
 
             UNION ALL
             SELECT po.profile_id, DATE(po.created_at) AS event_date, 'Contest participation' AS Event_Name, {weights.get('contest_participation', 7)} AS Base_Weight
-            FROM `{tenant_project_id}.cohora.post` po
-            JOIN `{tenant_project_id}.cohora.profile` p ON po.profile_id = p.id
+            FROM `{tenant_project_id}.{dataset}.{tbl['post']}` po
+            JOIN `{tenant_project_id}.{dataset}.{tbl['profile']}` p ON po.profile_id = p.id
             CROSS JOIN window_dates w
             WHERE DATE(po.created_at) >= w.start_date AND po.post_type = 'CONTEST'
               AND (p.tenant_admin = FALSE OR p.tenant_admin IS NULL)
 
             UNION ALL
             SELECT p.id AS profile_id, DATE(p.created_at) AS event_date, 'Refer a friend' AS Event_Name, {weights.get('refer_a_friend', 9)} AS Base_Weight
-            FROM `{tenant_project_id}.cohora.profile` p
+            FROM `{tenant_project_id}.{dataset}.{tbl['profile']}` p
             CROSS JOIN window_dates w
             WHERE DATE(p.created_at) >= w.start_date AND p.referred_profile_id IS NOT NULL
              AND (p.tenant_admin = FALSE OR p.tenant_admin IS NULL)
 
             UNION ALL
             SELECT pa.profile_id, DATE(pa.created_at) AS event_date, 'Redeem discount' AS Event_Name, {weights.get('redeem_discount', 9)} AS Base_Weight
-            FROM `{tenant_project_id}.cohora.profile_activity` pa
-            JOIN `{tenant_project_id}.cohora.profile` p ON pa.profile_id = p.id
+            FROM `{tenant_project_id}.{dataset}.{tbl['profile_activity']}` pa
+            JOIN `{tenant_project_id}.{dataset}.{tbl['profile']}` p ON pa.profile_id = p.id
             CROSS JOIN window_dates w
             WHERE DATE(pa.created_at) >= w.start_date AND pa.type = 'VOUCHER_PURCHASED'
               AND (p.tenant_admin = FALSE OR p.tenant_admin IS NULL)
 
             UNION ALL
             SELECT pa.profile_id, DATE(pa.created_at) AS event_date, 'Purchase from recommendation' AS Event_Name, {weights.get('purchase_recommendation', 10)} AS Base_Weight
-            FROM `{tenant_project_id}.cohora.profile_activity` pa
-            JOIN `{tenant_project_id}.cohora.profile` p ON pa.profile_id = p.id
+            FROM `{tenant_project_id}.{dataset}.{tbl['profile_activity']}` pa
+            JOIN `{tenant_project_id}.{dataset}.{tbl['profile']}` p ON pa.profile_id = p.id
             CROSS JOIN window_dates w
             WHERE DATE(pa.created_at) >= w.start_date AND pa.type = 'SHOPIFY_DISCOUNT_PURCHASED'
               AND (p.tenant_admin = FALSE OR p.tenant_admin IS NULL)
 
             UNION ALL
             SELECT po.profile_id, DATE(po.created_at) AS event_date, 'UGC' AS Event_Name, {weights.get('ugc', 9)} AS Base_Weight
-            FROM `{tenant_project_id}.cohora.post` po
-            JOIN `{tenant_project_id}.cohora.profile` p ON po.profile_id = p.id
+            FROM `{tenant_project_id}.{dataset}.{tbl['post']}` po
+            JOIN `{tenant_project_id}.{dataset}.{tbl['profile']}` p ON po.profile_id = p.id
             CROSS JOIN window_dates w
             WHERE DATE(po.created_at) >= w.start_date AND po.post_type = 'POST'
               AND (p.tenant_admin = FALSE OR p.tenant_admin IS NULL)
 
             UNION ALL
             SELECT w.profile_id, DATE(w.created_at) AS event_date, 'Redeem loyalty points' AS Event_Name, {weights.get('redeem_loyalty', 8)} AS Base_Weight
-            FROM `{tenant_project_id}.cohora.wallet_transaction` w
-            JOIN `{tenant_project_id}.cohora.profile` p ON w.profile_id = p.id
+            FROM `{tenant_project_id}.{dataset}.{tbl['wallet_transaction']}` w
+            JOIN `{tenant_project_id}.{dataset}.{tbl['profile']}` p ON w.profile_id = p.id
             CROSS JOIN window_dates wd
             WHERE DATE(w.created_at) >= wd.start_date 
               AND w.state = 'SUCCESS'
               AND (p.tenant_admin = FALSE OR p.tenant_admin IS NULL)
         ),
 
-        -- STEP 2 & 3: CALCULATE RECENCY AND FREQUENCY MULTIPLIERS
         event_multipliers AS (
             SELECT 
                 profile_id,
@@ -184,7 +179,6 @@ def get_engagement_scores(tenant_project_id: str, tenant_config: dict) -> pd.Dat
                 Base_Weight,
                 DATE_DIFF(CURRENT_DATE(), event_date, DAY) AS days_since,
 
-                -- Recency Multiplier
                 CASE 
                     WHEN DATE_DIFF(CURRENT_DATE(), event_date, DAY) <= 3 THEN 1.5
                     WHEN DATE_DIFF(CURRENT_DATE(), event_date, DAY) <= 14 THEN 1.2
@@ -198,7 +192,6 @@ def get_engagement_scores(tenant_project_id: str, tenant_config: dict) -> pd.Dat
             FROM raw_events
         ),
 
-        -- STEP 4: CALCULATE FINAL EVENT SCORES & APPLY FREQUENCY LOGIC
         scored_events AS (
             SELECT 
                 profile_id,
@@ -218,7 +211,6 @@ def get_engagement_scores(tenant_project_id: str, tenant_config: dict) -> pd.Dat
             FROM event_multipliers
         ),
 
-        -- STEP 5: AGGREGATE RAW SCORE PER USER
         user_raw_scores AS (
             SELECT 
                 profile_id,
@@ -234,8 +226,6 @@ def get_engagement_scores(tenant_project_id: str, tenant_config: dict) -> pd.Dat
             FROM user_raw_scores
         )
 
-        -- STEP 6 & 7: NORMALIZE (0-100) AND ASSIGN BANDS
-        -- Note: Column aliases changed to lowercase
         SELECT 
             u.profile_id AS profile_id,
             ROUND(u.raw_score, 2) AS raw_engagement_score,
@@ -257,66 +247,39 @@ def get_engagement_scores(tenant_project_id: str, tenant_config: dict) -> pd.Dat
         ORDER BY ces_score DESC;
     """
 
-    df_engagement = bq_client.query(sql_query).to_dataframe()
-    return df_engagement
+    return bq_client.query(sql_query).to_dataframe()
 
 
 # ==========================================
 # 2. MAIN EXECUTION PIPELINE
 # ==========================================
-def main():
-    # --- 1. Configuration Payload ---
-    tenant_name = "client-pmd"
-
-    json_string_from_db = """
-    {
-        "tenant_id": "client_101",
-        "expected_cycle_days": 30,
-        "top_percentile": 0.75,
-        "bottom_percentile": 0.25,
-        "vip_purchase_min": 5,
-        "revenue_high_override": null,
-        "revenue_low_override": null,
-        "expected_lifespan_years": 3,
-        "engagement_weights": {
-            "like": 1,
-            "comment": 5,
-            "share": 6,
-            "profile_completion": 4,
-            "contest_like": 4,
-            "contest_comment": 5,
-            "email_click": 4,
-            "scratch_card": 5,
-            "creator_post": 6,
-            "poll": 6,
-            "survey": 7,
-            "quiz": 7,
-            "contest_participation": 7,
-            "refer_a_friend": 9,
-            "redeem_discount": 9,
-            "purchase_recommendation": 10,
-            "ugc": 9,
-            "redeem_loyalty": 8
-        }
-    }
+def run_segmentation(config_path: str, tenant_config: dict) -> pd.DataFrame:
     """
-    tenant_config = json.loads(json_string_from_db)
-    print(f"Loaded config for: {tenant_config['tenant_id']}")
-    print(f"Cycle Days set to: {tenant_config['expected_cycle_days']}")
+    Main execution pipeline. Returns the fully joined and mapped Customer 360 DataFrame.
+    """
+    # --- 1. Load Configurations ---
+    with open(config_path, 'r') as file:
+        config = yaml.safe_load(file)
+
+    billing_project = config['gcp']['billing_project']
+    tenant_project_id = config['tenant']['project_id']
+    dataset = config['tenant']['cohora_dataset']
+    tbl = config['tables']
+
+    bq_client = bigquery.Client(project=billing_project)
 
     # --- 2. Fetch Transaction Data ---
-    client = bigquery.Client(project='cohora-develop')
-    query = """
+    query = f"""
        SELECT id, profile_id, processed_at, current_total_price 
-       FROM `client-pmd.cohora.order` 
+       FROM `{tenant_project_id}.{dataset}.{tbl['order']}` 
     """
     try:
-        print(f"Fetching transaction data from {tenant_name} project...")
-        df = client.query(query).to_dataframe()
-        print(f"Success! Loaded {len(df)} rows.")
+        df = bq_client.query(query).to_dataframe()
     except Exception as e:
-        print(f"Error connecting to BigQuery: {e}")
-        return
+        raise RuntimeError(f"Failed to fetch transaction data: {e}")
+
+    if df.empty:
+        return pd.DataFrame()
 
     # --- 3. Process Transactions (Customer 360) ---
     df['processed_at'] = pd.to_datetime(df['processed_at'], errors='coerce')
@@ -352,7 +315,6 @@ def main():
 
     f_low_val = customer_metrics['frequency'].quantile(p_bottom)
     f_high_val = customer_metrics['frequency'].quantile(p_top)
-
     r_low_val = customer_metrics['recency_days'].quantile(p_bottom)
     r_high_val = customer_metrics['recency_days'].quantile(p_top)
 
@@ -401,7 +363,7 @@ def main():
 
     customer_metrics['purchase_tier'] = customer_metrics['frequency'].apply(assign_purchase_tier)
 
-    # --- 7. Calculate CLTV and pCLTV (Lowercased variables) ---
+    # --- 7. Calculate CLTV and pCLTV ---
     customer_metrics['historical_cltv'] = customer_metrics['total_revenue']
     customer_metrics['aov'] = customer_metrics['total_revenue'] / customer_metrics['frequency']
     customer_metrics['age_years'] = np.maximum(customer_metrics['lifespan'], 1) / 365.0
@@ -422,13 +384,11 @@ def main():
 
     customer_metrics['predicted_cltv'] = customer_metrics.apply(apply_churn_penalty, axis=1)
 
-    # Clean up financial columns
     customer_metrics['predicted_cltv'] = customer_metrics['predicted_cltv'].round(2)
     customer_metrics['historical_cltv'] = customer_metrics['historical_cltv'].round(2)
     customer_metrics['aov'] = customer_metrics['aov'].round(2)
     customer_metrics = customer_metrics.drop(columns=['age_years', 'annual_purchase_rate'])
 
-    # Segment Name Construction
     customer_metrics['name_of_segment'] = (
         customer_metrics['macro_segment'] + '_' + 
         customer_metrics['audience_type'] + '_Purchase ' + 
@@ -436,10 +396,8 @@ def main():
     )
 
     # --- 8. Fetch Engagement Data & Merge ---
-    print(f"Fetching Engagement Scores for {tenant_name}...")
-    df_engagement = get_engagement_scores(tenant_project_id=tenant_name, tenant_config=tenant_config)
+    df_engagement = get_engagement_scores(bq_client, config, tenant_config)
 
-    # Merge directly on 'profile_id' since both now use lowercase
     df_combined = pd.merge(
         customer_metrics, 
         df_engagement, 
@@ -525,14 +483,7 @@ def main():
     for col in int_cols:
         df_combined[col] = df_combined[col].astype('Int64')
 
-    # --- 11. Save Final Output ---
-    output_file = 'Customer_360_Final.csv'
-    df_combined.to_csv(output_file, index=False)
-    print(f"\nSuccess! Final Data processing complete. Saved to '{output_file}'")
-    print(df_combined[['profile_id', 'persona_overlay', 'historical_cltv', 'predicted_cltv']].head())
-
-if __name__ == "__main__":
-    main()
+    return df_combined
 
 
 # In[ ]:
