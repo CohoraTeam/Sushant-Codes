@@ -1,0 +1,16 @@
+gcp:
+  billing_project: "cohora-develop"
+tenant:
+  project_id: "client-pmd"
+  cohora_dataset: "cohora"
+tables:
+  order: "order"
+  like: "like"
+  profile: "profile"
+  comment: "comment"
+  push_out: "push_out"
+  contest_entry: "contest_entry"
+  profile_activity: "profile_activity"
+  post_asset: "post_asset"
+  post: "post"
+  wallet_transaction: "wallet_transaction"
